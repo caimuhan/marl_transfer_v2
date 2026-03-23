@@ -108,7 +108,7 @@ def setup_master(args, env=None, return_env=False):
 
     if args.continue_training:
         print("Loading pretrained model")
-        master.load_models(torch.load(args.load_dir)['models'])
+        master.load_models(torch.load(args.load_dir, weights_only=False)['models'])
 
     if return_env:
         return master, env

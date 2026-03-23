@@ -122,7 +122,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
 
 if __name__ == '__main__':
     args = get_args()
-    checkpoint = torch.load(args.load_dir, map_location=lambda storage, loc: storage)
+    checkpoint = torch.load(args.load_dir, map_location=lambda storage, loc: storage, weights_only=False)
     policies_list = checkpoint['models']
     ob_rms = checkpoint['ob_rms']
 
