@@ -57,6 +57,7 @@ class raw_env(SimpleEnv, EzPickle):
             dist_threshold=0.1,
             arena_size=1,
             identity_size=0,
+            success_bonus=False,
     ):
         EzPickle.__init__(
             self,
@@ -67,12 +68,14 @@ class raw_env(SimpleEnv, EzPickle):
             dist_threshold=dist_threshold,
             arena_size=arena_size,
             identity_size=identity_size,
+            success_bonus=success_bonus,
         )
         scenario = Scenario(
             num_agents=N,
             dist_threshold=dist_threshold,
             arena_size=arena_size,
             identity_size=identity_size,
+            success_bonus=success_bonus,
         )
         world = scenario.make_world()
         SimpleEnv.__init__(
@@ -100,13 +103,15 @@ class Scenario(BaseScenario):
     完全对齐 marl_transfer/mape/multiagent/scenarios/simple_spread.py
     """
 
-    def __init__(self, num_agents=4, dist_threshold=0.1, arena_size=1, identity_size=0):
+    def __init__(self, num_agents=4, dist_threshold=0.1, arena_size=1, identity_size=0, success_bonus=False):
         self.num_agents = num_agents
         self.rewards = np.zeros(self.num_agents)
         self.temp_done = False#
         self.dist_threshold = dist_threshold
         self.arena_size = arena_size
         self.identity_size = identity_size
+        self.success_bonus = success_bonus
+        self.success_bonus_value = 5.0
         self.is_success = False
         self.min_dists = None
 
@@ -205,6 +210,9 @@ class Scenario(BaseScenario):
             self.min_dists = self._bipartite_min_dists(world.dists)
             # the reward is normalized by the number of agents
             joint_reward = np.clip(-np.mean(self.min_dists), -15, 15)
+            self.is_success = np.all(self.min_dists < world.dist_thres)
+            if self.success_bonus and self.is_success:
+                joint_reward += self.success_bonus_value
             self.rewards = np.full(self.num_agents, joint_reward)
             world.min_dists = self.min_dists
         return self.rewards.mean()
@@ -274,6 +282,9 @@ class Scenario(BaseScenario):
         segments: list of [(x1,y1),(x2,y2)]
         total_points: landmark数量
         """
+        if total_points <= 0:
+            return np.zeros((0, 2))
+
         # 计算每条线段长度
         lengths = []
         for (p1, p2) in segments:
@@ -284,15 +295,18 @@ class Scenario(BaseScenario):
         lengths = np.array(lengths)
         total_length = lengths.sum()
 
-        # 按比例分配点数
-        points_per_segment = np.maximum(
-            1,
-            np.round(total_points * lengths / total_length).astype(int)
-        )
-
-        # 修正数量误差
-        diff = total_points - points_per_segment.sum()
-        points_per_segment[0] += diff
+        if total_length <= 0:
+            # 退化情况：所有线段长度为 0，则把点均匀分配到前几个线段
+            points_per_segment = np.zeros(len(segments), dtype=int)
+            points_per_segment[:total_points] = 1
+        else:
+            # 非负整数分配：先按比例下取整，再把余量分配给小数部分最大的线段
+            raw_points = total_points * lengths / total_length
+            points_per_segment = np.floor(raw_points).astype(int)
+            remainder = total_points - points_per_segment.sum()
+            if remainder > 0:
+                frac_order = np.argsort(-(raw_points - points_per_segment))
+                points_per_segment[frac_order[:remainder]] += 1
 
         # 生成点
         points = []

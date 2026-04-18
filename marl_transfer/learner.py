@@ -28,7 +28,8 @@ def setup_master(args, env=None, return_env=False):
             num_agents=args.num_agents,
             dist_threshold=args.dist_threshold,
             arena_size=args.arena_size,
-            identity_size=args.identity_size
+            identity_size=args.identity_size,
+            success_bonus=args.success_bonus
         )
 
     policy1 = None

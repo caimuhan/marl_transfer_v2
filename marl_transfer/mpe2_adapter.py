@@ -143,11 +143,12 @@ class MPE2GymWrapper:
         # 更新 world.steps
         self.world.steps += 1
 
+        success_done = False
         if self.n > 0:
-             # 使用第一个 agent 来触发检查
-             agent_0 = self.world.agents[0]
-             # 更新 is_success 状态
-             self.scenario.done(agent_0, self.world)
+            # 使用第一个 agent 来触发检查
+            agent_0 = self.world.agents[0]
+            # 更新 is_success 状态，并在成功时提前结束
+            success_done = self.scenario.done(agent_0, self.world)
 
         # 转换回列表形式
         obs_n = []
@@ -157,7 +158,8 @@ class MPE2GymWrapper:
         for i, agent_name in enumerate(self.agent_names):
             obs_n.append(obs_dict.get(agent_name, np.zeros(self.observation_space[i].shape)))
             reward_n.append(reward_dict.get(agent_name, 0.0))
-            done_n.append(term_dict.get(agent_name, False) or trunc_dict.get(agent_name, False))
+            base_done = term_dict.get(agent_name, False) or trunc_dict.get(agent_name, False)
+            done_n.append(base_done or success_done)
 
         # 处理共享奖励
         if self.shared_reward:
@@ -564,7 +566,7 @@ class SimpleLineScenario(BaseScenario):
 # 环境创建函数
 # ============================================================
 
-def create_mpe2_env(env_id, num_agents=3, dist_threshold=0.1, arena_size=1, identity_size=0):
+def create_mpe2_env(env_id, num_agents=3, dist_threshold=0.1, arena_size=1, identity_size=0, success_bonus=False):
     """
     创建 mpe2 环境并包装成 marl_transfer 兼容接口
 
@@ -574,20 +576,21 @@ def create_mpe2_env(env_id, num_agents=3, dist_threshold=0.1, arena_size=1, iden
         dist_threshold: 距离阈值
         arena_size: 场地大小
         identity_size: 身份向量大小（0 表示不使用）
+        success_bonus: 是否启用成功奖励（仅 simple_spread）
 
     Returns:
         MPE2GymWrapper: 包装后的环境，与 marl_transfer 兼容
     """
     # 选择场景
     if env_id == 'simple_spread':
-        scenario = SimpleSpreadScenario(num_agents, dist_threshold, arena_size, identity_size)
+        scenario = SimpleSpreadScenario(num_agents, dist_threshold, arena_size, identity_size, success_bonus)
     elif env_id == 'simple_formation':
         scenario = SimpleFormationScenario(num_agents, dist_threshold, arena_size, identity_size)
     elif env_id == 'simple_line':
         scenario = SimpleLineScenario(num_agents, dist_threshold, arena_size, identity_size)
     else:
         # 默认使用 simple_spread
-        scenario = SimpleSpreadScenario(num_agents, dist_threshold, arena_size, identity_size)
+        scenario = SimpleSpreadScenario(num_agents, dist_threshold, arena_size, identity_size, success_bonus)
 
     world = scenario.make_world()
 
@@ -599,8 +602,8 @@ def create_mpe2_env(env_id, num_agents=3, dist_threshold=0.1, arena_size=1, iden
                 self,
                 scenario=scenario,
                 world=world,
-                # render_mode=None,
-                render_mode="human",
+                render_mode=None,
+                # render_mode="human",
                 max_cycles=50,
                 continuous_actions=False,
                 local_ratio=None,

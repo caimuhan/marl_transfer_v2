@@ -28,6 +28,8 @@ def get_args():
     # evaluation
     parser.add_argument('--num-eval-episodes', type=int, default=30, help='number of episodes to evaluate with')
     parser.add_argument('--dist-threshold', type=float, default=0.1, help='distance within landmark is considered covered (for simple_spread)')
+    parser.add_argument('--success-bonus', action='store_true', default=False,
+                        help='enable +5 reward bonus when simple_spread succeeds')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--record-video', action='store_true', default=False, help='record evaluation video')
     

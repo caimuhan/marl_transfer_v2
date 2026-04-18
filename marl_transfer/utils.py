@@ -14,7 +14,7 @@ def normalize_obs(obs, mean, std):
         return obs
 
 
-def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size):
+def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size, success_bonus=False):
     """
     创建多智能体环境 - 使用 mpe2 适配器
 
@@ -24,6 +24,7 @@ def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity
         dist_threshold: 距离阈值
         arena_size: 场地大小
         identity_size: 身份向量大小
+        success_bonus: 是否启用成功奖励（仅 simple_spread）
 
     Returns:
         env: 与 marl_transfer 兼容的环境
@@ -33,14 +34,15 @@ def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity
         num_agents=num_agents,
         dist_threshold=dist_threshold,
         arena_size=arena_size,
-        identity_size=identity_size
+        identity_size=identity_size,
+        success_bonus=success_bonus
     )
 
 
-def make_env(env_id, seed, rank, num_agents, dist_threshold, arena_size, identity_size):
+def make_env(env_id, seed, rank, num_agents, dist_threshold, arena_size, identity_size, success_bonus=False):
     """创建单个环境的工厂函数（用于并行环境）"""
     def _thunk():
-        env = make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size)
+        env = make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size, success_bonus)
         return env
     return _thunk
 
@@ -48,7 +50,7 @@ def make_env(env_id, seed, rank, num_agents, dist_threshold, arena_size, identit
 def make_parallel_envs(args):
     """创建并行环境"""
     envs = [make_env(args.env_name, args.seed, i, args.num_agents,
-                     args.dist_threshold, args.arena_size, args.identity_size)
+                     args.dist_threshold, args.arena_size, args.identity_size, args.success_bonus)
             for i in range(args.num_processes)]
 
     if args.num_processes > 1:
