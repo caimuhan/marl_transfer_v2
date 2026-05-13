@@ -49,28 +49,28 @@ def build_mpnn(state_dict, num_agents, num_entities, input_size, device="cpu"):
 
 
 def run_eval_episode(env, policy, device="cpu", render=False):
-    obs_list = env.reset(seed=42)
+    obs = env.reset(seed=42)  # [num_envs, num_agents, obs_dim]
     total_reward = 0.0
 
     for step in range(MAX_STEPS):
-        obs_batch = torch.as_tensor(np.stack(obs_list), dtype=torch.float, device=device)
-
+        obs_batch = obs[0]  # take env 0
         with torch.no_grad():
             _, action, _, _ = policy.act(obs_batch, None, None, deterministic=True)
-        actions = action.squeeze(-1).cpu().numpy()
+        # action: [num_agents, 1]; wrap each agent as [1, 1] tensor for VMAS step
+        actions = [action[i:i+1] for i in range(env.num_agents)]
 
-        obs_list, reward_list, done_list, info = env.step(actions)
-        total_reward += reward_list[0]
+        obs, reward, done, info = env.step(actions)
+        total_reward += reward[0, 0].item()
 
         if render:
             env.render()
 
-        if all(done_list):
+        if done[0, 0]:
             break
 
-    success = env.is_success
-    steps = env.steps
-    final_dist = env.min_dists.mean() if env.min_dists is not None else float("nan")
+    success = env._is_success[0].item()
+    steps = env._env.steps[0].item()
+    final_dist = env.min_dists[0].mean().item() if env.min_dists is not None else float("nan")
     return total_reward, success, steps, final_dist
 
 
@@ -112,10 +112,12 @@ def main():
 
         env = VMASSimpleSpread(
             num_agents=n_agents,
+            num_envs=1,
             arena_size=1.0,
             dist_threshold=0.1,
             identity_size=0,
             success_bonus=True,
+            device=device,
         )
         env.seed(42)
 

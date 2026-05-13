@@ -17,9 +17,10 @@ def get_args():
     parser.add_argument('--entity-mp', action='store_true', help='enable entity message passing')
     parser.add_argument('--identity-size', default=0, type=int, help='size of identity vector')
 
-    # training 
+    # training
     parser.add_argument('--seed', type=int, default=None, help='random seed (default: None)')
-    parser.add_argument('--num-processes', type=int, default=32, help='how many training CPU processes to use (default: 32)')
+    parser.add_argument('--num-processes', type=int, default=32, help='how many training CPU processes to use (default: 32). For VMAS: number of parallel environments')
+    parser.add_argument('--num-envs', type=int, default=32, help='number of parallel VMAS environments on GPU (default: 32)')
     parser.add_argument('--num-steps', type=int, default=128, help='number of forward steps in PPO (default: 128)')
     parser.add_argument('--no-cuda', action='store_true', default=False, help='disables CUDA training')
     parser.add_argument('--num-frames', type=int, default=int(50e6), help='number of frames to train (default: 50e6)')

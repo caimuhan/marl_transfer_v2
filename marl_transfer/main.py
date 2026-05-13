@@ -20,28 +20,44 @@ np.set_printoptions(suppress=True, precision=4)
 
 def train(args, return_early=False):
     writer = SummaryWriter(args.log_dir)
-    envs = utils.make_parallel_envs(args)
+
+    # --- Env factory: VMAS (GPU-native) for simple_spread, MPE2 otherwise ---
+    use_vmas = (args.env_name == 'simple_spread')
+    if use_vmas:
+        envs = utils.make_vmas_env(args)
+        num_envs = args.num_envs
+    else:
+        envs = utils.make_parallel_envs(args)
+        num_envs = args.num_processes
+
     master = setup_master(args)
-    # 用于评估
     eval_master, eval_env = setup_master(args, return_env=True)
-    obs = envs.reset()  # shape - num_processes x num_agents x obs_dim
+
+    obs = envs.reset()  # tensor [num_envs, num_agents, obs_dim] (vmas) or numpy
     master.initialize_obs(obs)
     n = len(master.all_agents)
-    episode_rewards = torch.zeros([args.num_processes, n], device=args.device)
-    final_rewards = torch.zeros([args.num_processes, n], device=args.device)
+    episode_rewards = torch.zeros([num_envs, n], device=args.device)
+    final_rewards = torch.zeros([num_envs, n], device=args.device)
 
     # 开始训练
     start = datetime.datetime.now()
     for j in range(args.num_updates):
         for step in range(args.num_steps):
             with torch.no_grad():
-                actions_list = master.act(step)
-            agent_actions = np.transpose(np.array(actions_list), (1, 0, 2))
-            obs, reward, done, info = envs.step(agent_actions)
-            reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
-            episode_rewards += reward
-            masks = torch.FloatTensor(1 - 1.0 * done).to(args.device)
+                actions_list = master.act(step)  # list of num_agents tensors [num_envs, 1]
 
+            if use_vmas:
+                obs, reward, done, info = envs.step(actions_list)
+                # reward/done/obs already tensors on device
+                masks = (~done).float()
+            else:
+                agent_actions = np.transpose(
+                    np.array([a.cpu().numpy() for a in actions_list]), (1, 0, 2))
+                obs, reward, done, info = envs.step(agent_actions)
+                reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
+                masks = torch.FloatTensor(1 - 1.0 * done).to(args.device)
+
+            episode_rewards += reward
             final_rewards *= masks
             final_rewards += (1 - masks) * episode_rewards
             episode_rewards *= masks
@@ -62,7 +78,7 @@ def train(args, return_early=False):
             savedir = args.save_dir + '/ep' + str(j) + '.pt'
             torch.save(savedict, savedir)
 
-        total_num_steps = (j + 1) * args.num_processes * args.num_steps
+        total_num_steps = (j + 1) * num_envs * args.num_steps
 
         if j % args.log_interval == 0:
             end = datetime.datetime.now()
@@ -127,7 +143,8 @@ if __name__ == '__main__':
     args = get_args()
     if args.seed is None:
         args.seed = random.randint(0, 10000)
-    args.num_updates = args.num_frames // args.num_steps // args.num_processes
+    num_envs = args.num_envs if args.env_name == 'simple_spread' else args.num_processes
+    args.num_updates = args.num_frames // args.num_steps // num_envs
     torch.manual_seed(args.seed)
     torch.set_num_threads(1)
     np.random.seed(args.seed)

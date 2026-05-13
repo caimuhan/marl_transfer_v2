@@ -171,34 +171,54 @@ class SimpleSpreadScenario(BaseScenario):
 
 
 # ============================================================
-#  Wrapper  (PyMunkSimpleSpread-compatible interface)
+#  Precomputed action map (GPU tensor)
+# ============================================================
+_ACTION_MAP_NP = np.array([
+    [0.0, 0.0],     # 0: noop
+    [-1.0, 0.0],    # 1: left
+    [1.0, 0.0],     # 2: right
+    [0.0, -1.0],    # 3: down
+    [0.0, 1.0],     # 4: up
+], dtype=np.float32)
+
+
+def _build_action_map(device):
+    return torch.as_tensor(_ACTION_MAP_NP, device=device)
+
+
+# ============================================================
+#  Wrapper — multi-env, GPU-native tensor interface
 # ============================================================
 class VMASSimpleSpread:
     """
-    VMAS-powered simple_spread with the same interface as PyMunkSimpleSpread.
+    VMAS-powered simple_spread with GPU-native tensor interface.
 
     Compatible with:
-      - learnt.setup_master()   (world.policy_agents, action_space, obs_space)
-      - test_inference.py       (reset/step/seed/close/render)
+      - learner.setup_master()   (world.policy_agents, action_space, obs_space)
+      - test_inference.py        (reset/step/seed/close/render)
     """
 
-    def __init__(self, num_agents=3, arena_size=1.0, dist_threshold=0.1,
-                 identity_size=0, success_bonus=True):
+    def __init__(self, num_agents=3, num_envs=32, arena_size=1.0,
+                 dist_threshold=0.1, identity_size=0, success_bonus=True,
+                 device="cpu"):
         self.num_agents = num_agents
         self.num_landmarks = num_agents
+        self.num_envs = num_envs
+        self.n = num_agents  # compat: gym_vecenv VecEnv expects .n
         self.arena_size = arena_size
         self.dist_threshold = dist_threshold
         self.identity_size = identity_size
         self.success_bonus = success_bonus
+        self.device = device
 
         self.input_size = identity_size + 4
         self.obs_dim = self.input_size + 2 * self.num_landmarks
 
-        # Single-environment VMAS
+        # ---- VMAS environment (batched) -------------------------------
         self._env = Environment(
             scenario=SimpleSpreadScenario(),
-            num_envs=1,
-            device="cpu",
+            num_envs=num_envs,
+            device=device,
             continuous_actions=True,
             max_steps=MAX_STEPS,
             n_agents=num_agents,
@@ -209,11 +229,14 @@ class VMASSimpleSpread:
             obs_agents=False,
         )
 
-        # ---- Dummy world for learner compatibility -------------------
+        # ---- Action map (GPU tensor) ----------------------------------
+        self._action_map = _build_action_map(device)
+
+        # ---- Dummy world for learner compatibility --------------------
         self._dummy_agent_list = [_DummyAgent(i) for i in range(num_agents)]
         self.world = _DummyWorld(self._dummy_agent_list)
 
-        # ---- Action / observation spaces -----------------------------
+        # ---- Action / observation spaces ------------------------------
         try:
             import gymnasium as gym
             self.action_space = [gym.spaces.Discrete(5) for _ in range(num_agents)]
@@ -224,93 +247,117 @@ class VMASSimpleSpread:
             self.action_space = None
             self.observation_space = None
 
-        # ---- State --------------------------------------------------
-        self.steps = 0
-        self.is_success = False
+        # ---- State ----------------------------------------------------
+        self.ob_rms = None  # eval compat (may be set externally)
+        self._seed_val = None
+        self._is_success = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self.min_dists = None
-        self._np_random = np.random
-        self._seed = None
 
-        self.reset()
+        self._reset_all()
 
     # ================================================================
     #  Reset
     # ================================================================
+    def _reset_all(self):
+        obs_list = self._env.reset()  # list of num_agents tensors [num_envs, obs_dim]
+        self._is_success.zero_()
+        self.min_dists = None
+        return torch.stack(obs_list, dim=1)  # [num_envs, num_agents, obs_dim]
+
     def reset(self, seed=None):
         if seed is not None:
-            self._seed = seed
-        if self._seed is not None:
-            self._env.seed(self._seed)
-
-        obs = self._env.reset()
-        self.steps = 0
-        self.is_success = False
-        self.min_dists = None
-        return [o[0].cpu().numpy() for o in obs]
+            self._seed_val = seed
+        if self._seed_val is not None:
+            self._env.seed(self._seed_val)
+        return self._reset_all()
 
     # ================================================================
-    #  Step
+    #  Step  (tensor-in, tensor-out)
     # ================================================================
     def step(self, actions):
         """
-        actions: list of ints [0..4], one per agent.
-        Returns: (obs_list, reward_list, done_list, info_dict)
+        actions: list of num_agents tensors, each [num_envs, 1] (int 0-4).
+
+        Returns:
+            obs:    tensor [num_envs, num_agents, obs_dim]
+            reward: tensor [num_envs, num_agents]
+            done:   tensor [num_envs, num_agents] (bool)
+            info:   dict  {'n': [per_agent_dict, ...]}
         """
-        # Discrete(5) → continuous forces
+        # Discrete(5) → continuous forces via lookup table
         forces = []
         for act in actions:
-            a = int(act)
-            fx, fy = ACTION_MAP[a]
-            forces.append(torch.tensor([[fx, fy]], dtype=torch.float32))
+            if not isinstance(act, torch.Tensor):
+                act = torch.as_tensor(act, dtype=torch.float32, device=self.device)
+            elif act.device != self.device:
+                act = act.to(self.device)
+            idx = act.squeeze(-1).long()  # [num_envs]
+            forces.append(self._action_map[idx])  # [num_envs, 2]
 
-        obs, rews, dones, infos = self._env.step(forces)
+        obs_list, rews_list, vmas_dones, _infos = self._env.step(forces)
+        # obs_list:  list of num_agents tensors [num_envs, obs_dim]
+        # rews_list: list of num_agents tensors [num_envs]
+        # vmas_dones: tensor [num_envs]  (True when max_steps reached)
 
-        self.steps += 1
+        self._compute_success_vectorized()
 
-        # --- Convert to numpy (matching PyMunk interface) ---
-        obs_list = [o[0].cpu().numpy() for o in obs]
-        reward = float(rews[0][0].cpu().numpy())
-        reward_list = [reward] * self.num_agents
+        done_env = vmas_dones | self._is_success  # [num_envs] bool
 
-        # --- Compute success via Hungarian matching ---
-        self._compute_success()
-        done = bool(dones[0].cpu().numpy()) if dones is not None else False
-        done = done or self.is_success or (self.steps >= MAX_STEPS)
-        done_list = [done] * self.num_agents
+        # --- Auto-reset environments that reached terminal state -----
+        done_idx = torch.where(done_env)[0]
+        if len(done_idx) > 0:
+            for i in done_idx.tolist():
+                self._env._reset_at(i, return_observations=False)
+            # Re-read observations (mix of reset + continuing envs)
+            obs_list = [
+                self._env.scenario.observation(a).clone()
+                for a in self._env.agents
+            ]
 
-        info_dict = {'n': [{
-            'is_success': self.is_success,
-            'world_steps': self.steps,
-            'reward': reward,
-            'dists': float(self.min_dists.mean()) if self.min_dists is not None else 0,
+        # --- Pack outputs ---------------------------------------------
+        obs = torch.stack(obs_list, dim=1)            # [num_envs, num_agents, obs_dim]
+        reward = torch.stack(rews_list, dim=1)        # [num_envs, num_agents]
+        done = done_env.unsqueeze(1).expand(-1, self.num_agents)  # broadcast
+
+        # Info dict for eval compatibility (uses env 0 stats)
+        info = {'n': [{
+            'is_success': self._is_success[0].item(),
+            'world_steps': self._env.steps[0].item(),
+            'reward': reward[0, 0].item(),
         } for _ in range(self.num_agents)]}
 
-        return obs_list, reward_list, done_list, info_dict
+        return obs, reward, done, info
 
-    def _compute_success(self):
-        """Hungarian matching success check."""
-        agent_pos = np.array([
-            self._env.world.agents[i].state.pos[0].cpu().numpy()
-            for i in range(self.num_agents)
-        ])
-        landmark_pos = np.array([
-            self._env.world.landmarks[i].state.pos[0].cpu().numpy()
-            for i in range(self.num_landmarks)
-        ])
-        dists = np.array([
-            [np.linalg.norm(ap - lp) for lp in landmark_pos]
-            for ap in agent_pos
-        ])
-        ri, ci = linear_sum_assignment(dists)
-        self.min_dists = dists[ri, ci]
-        self.is_success = bool(np.all(self.min_dists < self.dist_threshold))
+    # ================================================================
+    #  Success detection (vectorised across envs)
+    # ================================================================
+    def _compute_success_vectorized(self):
+        agent_pos = torch.stack(
+            [a.state.pos for a in self._env.world.agents], dim=1
+        )  # [num_envs, num_agents, 2]
+        landmark_pos = torch.stack(
+            [l.state.pos for l in self._env.world.landmarks], dim=1
+        )  # [num_envs, num_landmarks, 2]
+        dists = torch.cdist(agent_pos, landmark_pos)  # [num_envs, N, N]
+
+        self.min_dists = torch.zeros(self.num_envs, self.num_agents,
+                                      device=self.device)
+        for b in range(self.num_envs):
+            d = dists[b].cpu().numpy()
+            ri, ci = linear_sum_assignment(d)
+            self.min_dists[b] = torch.as_tensor(d[ri, ci], device=self.device)
+            self._is_success[b] = bool(np.all(d[ri, ci] < self.dist_threshold))
+
+        # Reset success flag for just-reset envs (steps == 0)
+        just_reset = self._env.steps == 0
+        self._is_success[just_reset] = False
 
     # ================================================================
     #  Seed
     # ================================================================
     def seed(self, seed=None):
         if seed is not None:
-            self._seed = seed
+            self._seed_val = seed
             self._env.seed(seed)
 
     def close(self):
@@ -360,25 +407,26 @@ if __name__ == "__main__":
     print("VMAS Simple Spread — random policy test")
     print("=" * 50)
 
-    env = VMASSimpleSpread(num_agents=5, arena_size=1.0)
+    env = VMASSimpleSpread(num_agents=5, num_envs=1, arena_size=1.0, device="cpu")
 
-    obs_list = env.reset()
-    print(f"Observation shape per agent: {obs_list[0].shape}")
-    print(f"Expected: ({env.obs_dim},)")
+    obs = env.reset()
+    print(f"Observation shape: {obs.shape}")
+    print(f"Expected: ({1}, {env.num_agents}, {env.obs_dim})")
 
     total_reward = 0
     for step in range(MAX_STEPS):
-        actions = [np.random.randint(0, 5) for _ in range(env.num_agents)]
-        obs_list, reward_list, done_list, info = env.step(actions)
-        total_reward += reward_list[0]
+        acts = [torch.randint(0, 5, (1, 1)) for _ in range(env.num_agents)]
+        obs, reward, done, info = env.step(acts)
+        total_reward += reward[0, 0].item()
 
         if step % 10 == 0:
-            print(f"  step {step:2d}  reward={reward_list[0]:.3f}  "
-                  f"min_dist={env.min_dists.mean():.3f}  success={env.is_success}")
+            min_d = env.min_dists[0].mean().item() if env.min_dists is not None else float('nan')
+            print(f"  step {step:2d}  reward={reward[0,0].item():.3f}  "
+                  f"min_dist={min_d:.3f}  success={env._is_success[0].item()}")
 
-        if all(done_list):
+        if done[0, 0]:
             break
 
-    print(f"\nEpisode done after {env.steps} steps, total_reward={total_reward:.2f}")
+    print(f"\nEpisode done, total_reward={total_reward:.2f}")
     env.close()
     print("Done.")

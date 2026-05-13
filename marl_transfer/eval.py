@@ -70,7 +70,10 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             attn = None if not render_attn else master.team_attn
             if attn is not None and len(attn.shape) == 3:
                 attn = attn.max(0)
-            env.render(attn=attn)
+            try:
+                env.render(attn=attn)
+            except TypeError:
+                env.render()
 
         while not np.all(done):
             with torch.no_grad():
@@ -78,13 +81,18 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             episode_steps += 1
             obs, reward, done, info = env.step(actions)
             obs = normalize_obs(obs, obs_mean, obs_std)
-            episode_rewards += np.array(reward)
+            if isinstance(reward, torch.Tensor):
+                reward = reward.cpu().numpy()
+            episode_rewards += np.array(reward).squeeze()
 
             if render:
                 attn = None if not render_attn else master.team_attn
                 if attn is not None and len(attn.shape) == 3:
                     attn = attn.max(0)
-                env.render(attn=attn)
+                try:
+                    env.render(attn=attn)
+                except TypeError:
+                    env.render()
                 if args.record_video:
                     time.sleep(0.08)
 
@@ -98,8 +106,12 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
 
         # 获取最终距离
         if args.env_name == 'simple_spread':
-            if hasattr(env.world, 'min_dists') and env.world.min_dists is not None:
-                final_min_dists.append(env.world.min_dists)
+            min_dists = getattr(env, 'min_dists', None)
+            if min_dists is None:
+                min_dists = getattr(env.world, 'min_dists', None)
+            if min_dists is not None:
+                md = min_dists[0].cpu().numpy() if isinstance(min_dists, torch.Tensor) else min_dists
+                final_min_dists.append(md)
         elif args.env_name in ['simple_formation', 'simple_line']:
             if hasattr(env.world, 'dists') and len(env.world.dists) > 0:
                 final_min_dists.append(env.world.dists)

@@ -168,10 +168,13 @@ class Learner(object):
         初始化观察
 
         Args:
-            obs: 观察 (num_processes x num_agents x obs_dim)
+            obs: tensor or numpy array (num_envs x num_agents x obs_dim)
         """
         for i, agent in enumerate(self.all_agents):
-            agent.initialize_obs(torch.from_numpy(obs[:, i, :]).float().to(self.device))
+            agent_obs = obs[:, i, :]
+            if isinstance(agent_obs, np.ndarray):
+                agent_obs = torch.from_numpy(agent_obs).float().to(self.device)
+            agent.initialize_obs(agent_obs)
             agent.rollouts.to(self.device)
 
     def act(self, step):
@@ -202,7 +205,7 @@ class Learner(object):
                 team[i].action = all_action[i]
                 team[i].action_log_prob = all_action_log_prob[i]
                 team[i].states = all_states[i]
-                actions_list.append(all_action[i].cpu().numpy())
+                actions_list.append(all_action[i])  # keep on device
 
         return actions_list
 
@@ -236,10 +239,11 @@ class Learner(object):
             agent.after_update()
 
     def update_rollout(self, obs, reward, masks):
-        """更新 rollout"""
-        obs_t = torch.from_numpy(obs).float().to(self.device)
+        """更新 rollout (obs/reward/masks may be tensor or numpy)"""
+        if isinstance(obs, np.ndarray):
+            obs = torch.from_numpy(obs).float().to(self.device)
         for i, agent in enumerate(self.all_agents):
-            agent_obs = obs_t[:, i, :]
+            agent_obs = obs[:, i, :]
             agent.update_rollout(agent_obs, reward[:, i].unsqueeze(1), masks[:, i].unsqueeze(1))
 
     def load_models(self, policies_list):
@@ -252,46 +256,44 @@ class Learner(object):
         评估模式下的动作选择
 
         Args:
-            obs: 观察列表
+            obs: 观察 (list of numpy arrays, or tensor [num_envs, num_agents, obs_dim])
             recurrent_hidden_states: 循环隐藏状态
             mask: 掩码
 
         Returns:
-            actions: 动作数组
+            actions: 动作列表 (list of tensors, one per agent [num_envs, 1])
         """
-        obs1 = []
-        obs2 = []
-        all_obs = []
+        # Normalize to list-of-tensors format
+        if isinstance(obs, (list, tuple)):
+            obs_list = [torch.as_tensor(o, dtype=torch.float, device=self.device).view(1, -1)
+                        for o in obs]
+        else:
+            # tensor: [num_envs, num_agents, obs_dim]
+            if obs.dim() == 3:
+                obs_list = [obs[:, i, :] for i in range(obs.shape[1])]
+            else:
+                obs_list = [obs]
 
-        # 获取 policy_agents
+        obs1, obs2 = [], []
         policy_agents = self.env.world.policy_agents
 
-        for i in range(len(obs)):
-            agent = policy_agents[i]
-            obs_tensor = torch.as_tensor(obs[i], dtype=torch.float, device=self.device).view(1, -1)
-
+        for i, (agent, ot) in enumerate(zip(policy_agents, obs_list)):
             if hasattr(agent, 'adversary') and agent.adversary:
-                obs1.append(obs_tensor)
+                obs1.append(ot)
             else:
-                obs2.append(obs_tensor)
+                obs2.append(ot)
 
-        if len(obs1) != 0:
-            all_obs.append(obs1)
-        if len(obs2) != 0:
-            all_obs.append(obs2)
+        all_obs = [x for x in (obs1, obs2) if len(x) > 0]
 
         actions = []
-        for team, policy, obs_list in zip(self.teams_list, self.policies_list, all_obs):
-            if len(obs_list) != 0:
-                _, action, _, _ = policy.act(
-                    torch.cat(obs_list).to(self.device),
-                    None,
-                    None,
-                    deterministic=True
-                )
-                actions.append(action.squeeze(1).cpu().numpy())
+        for team, policy, obs_team in zip(self.teams_list, self.policies_list, all_obs):
+            _, action, _, _ = policy.act(
+                torch.cat(obs_team).to(self.device),
+                None, None, deterministic=True,
+            )
+            actions.append(action.squeeze(1).cpu().numpy())
 
-        return np.hstack(actions)
+        return np.hstack(actions) if actions else np.array([])
 
     def set_eval_mode(self):
         """设置评估模式"""
