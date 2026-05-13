@@ -1,0 +1,384 @@
+"""
+vmas_env/simple_spread.py
+
+VMAS-powered simple_spread with the same observation/action interface as
+marl_transfer's MPE2 environment.  Trained MPNN checkpoints can run
+inference on this environment with zero weight modification.
+
+Observation (entity_mp=True, identity_size=0):
+  [vel(2), pos(2), landmark_rel(2*N)]
+
+Action space: Discrete(5) → [noop, left, right, down, up]
+              bridged to VMAS continuous forces via ACTION_MAP.
+"""
+import os
+import sys
+
+# Ensure VMAS simulator is importable (cloned at ../VectorizedMultiAgentSimulator)
+_vmas_sim = os.path.join(os.path.dirname(__file__), "..", "VectorizedMultiAgentSimulator")
+if _vmas_sim not in sys.path:
+    sys.path.insert(0, _vmas_sim)
+
+# Gym compatibility: VMAS uses gym, but older gym versions may not support
+# array-like Box bounds.  Replace with gymnasium if available.
+try:
+    import gymnasium
+    import gym.spaces
+    gym.spaces.Box = gymnasium.spaces.Box
+except ImportError:
+    pass
+
+import numpy as np
+import torch
+from torch import Tensor
+from scipy.optimize import linear_sum_assignment
+
+from vmas.simulator.core import Agent, Landmark, Sphere, World
+from vmas.simulator.dynamics.holonomic import Holonomic
+from vmas.simulator.environment.environment import Environment
+from vmas.simulator.scenario import BaseScenario
+from vmas.simulator.utils import Color, X, Y
+
+# ============================================================
+#  Constants matching PyMunkSimpleSpread
+# ============================================================
+AGENT_SIZE = 0.05
+LANDMARK_SIZE = 0.05
+MAX_SPEED = 2.0
+ACTION_FORCE = 5.0
+DT = 0.1
+MAX_STEPS = 50
+
+# Discrete action → (fx, fy)  (unit forces, scaled by u_multiplier)
+ACTION_MAP = {
+    0: (0.0, 0.0),     # noop
+    1: (-1.0, 0.0),    # left
+    2: (1.0, 0.0),     # right
+    3: (0.0, -1.0),    # down
+    4: (0.0, 1.0),     # up
+}
+
+
+# ============================================================
+#  VMAS Scenario  (entity_mp aligned)
+# ============================================================
+class SimpleSpreadScenario(BaseScenario):
+    """
+    VMAS scenario matching MPE2 simple_spread with entity_mp=True.
+    Observation order: [vel, pos, landmark_rel] (vel first, matching MPE2).
+    Reward: Hungarian matching (same as original).
+    """
+
+    def make_world(self, batch_dim: int, device: torch.device, **kwargs) -> World:
+        n_agents = kwargs.pop("n_agents", 3)
+        self.arena_size = kwargs.pop("arena_size", 1.0)
+        self.dist_threshold = kwargs.pop("dist_threshold", 0.1)
+        self.success_bonus = kwargs.pop("success_bonus", True)
+        self.identity_size = kwargs.pop("identity_size", 0)
+        self.obs_agents = kwargs.pop("obs_agents", False)
+
+        self.n_agents = n_agents
+        self.num_landmarks = n_agents
+
+        world = World(
+            batch_dim=batch_dim,
+            device=device,
+            dt=DT,
+            x_semidim=self.arena_size,
+            y_semidim=self.arena_size,
+        )
+
+        # Agents
+        for i in range(n_agents):
+            agent = Agent(
+                name=f"agent_{i}",
+                collide=True,
+                shape=Sphere(radius=AGENT_SIZE),
+                mass=1.0,
+                max_speed=MAX_SPEED,
+                u_multiplier=ACTION_FORCE,
+                u_range=1.0,
+                color=Color.BLUE,
+            )
+            world.add_agent(agent)
+
+        # Landmarks (static)
+        for i in range(n_agents):
+            landmark = Landmark(
+                name=f"landmark_{i}",
+                collide=False,
+                shape=Sphere(radius=LANDMARK_SIZE),
+                color=Color.GRAY,
+            )
+            world.add_landmark(landmark)
+
+        return world
+
+    def reset_world_at(self, env_index: int = None):
+        rng = torch.zeros if env_index is not None else lambda shape, **kw: \
+            torch.zeros(shape, **kw).uniform_(-self.arena_size, self.arena_size)
+
+        for agent in self.world.agents:
+            shape = (1, self.world.dim_p) if env_index is not None else \
+                    (self.world.batch_dim, self.world.dim_p)
+            pos = torch.zeros(shape, device=self.world.device,
+                              dtype=torch.float32).uniform_(-self.arena_size,
+                                                            self.arena_size)
+            agent.set_pos(pos, batch_index=env_index)
+
+        for landmark in self.world.landmarks:
+            shape = (1, self.world.dim_p) if env_index is not None else \
+                    (self.world.batch_dim, self.world.dim_p)
+            pos = torch.zeros(shape, device=self.world.device,
+                              dtype=torch.float32).uniform_(-self.arena_size,
+                                                            self.arena_size)
+            landmark.set_pos(pos, batch_index=env_index)
+
+    def observation(self, agent: Agent) -> Tensor:
+        """[vel(2), pos(2), landmark_rel(2*N)] — vel first, matching MPE2."""
+        obs = [agent.state.vel, agent.state.pos]
+        for landmark in self.world.landmarks:
+            obs.append(landmark.state.pos - agent.state.pos)
+        if self.obs_agents:
+            for other in self.world.agents:
+                if other != agent:
+                    obs.append(other.state.pos - agent.state.pos)
+        return torch.cat(obs, dim=-1)
+
+    def reward(self, agent: Agent) -> Tensor:
+        """Hungarian matching reward — computed once per step (first agent)."""
+        if agent != self.world.agents[0]:
+            return self._reward
+
+        B = self.world.batch_dim
+        agent_pos = torch.stack([a.state.pos for a in self.world.agents], dim=1)
+        landmark_pos = torch.stack([l.state.pos for l in self.world.landmarks], dim=1)
+        dists = torch.cdist(agent_pos, landmark_pos)  # [B, N, N]
+
+        self._reward = torch.zeros(B, device=self.world.device)
+        for b in range(B):
+            d = dists[b].cpu().numpy()
+            ri, ci = linear_sum_assignment(d)
+            avg_d = d[ri, ci].mean()
+            r = float(np.clip(-avg_d, -15, 15))
+            if self.success_bonus and bool(np.all(d[ri, ci] < self.dist_threshold)):
+                r += 5.0
+            self._reward[b] = r
+        return self._reward
+
+    def info(self, agent: Agent):
+        return {}
+
+
+# ============================================================
+#  Wrapper  (PyMunkSimpleSpread-compatible interface)
+# ============================================================
+class VMASSimpleSpread:
+    """
+    VMAS-powered simple_spread with the same interface as PyMunkSimpleSpread.
+
+    Compatible with:
+      - learnt.setup_master()   (world.policy_agents, action_space, obs_space)
+      - test_inference.py       (reset/step/seed/close/render)
+    """
+
+    def __init__(self, num_agents=3, arena_size=1.0, dist_threshold=0.1,
+                 identity_size=0, success_bonus=True):
+        self.num_agents = num_agents
+        self.num_landmarks = num_agents
+        self.arena_size = arena_size
+        self.dist_threshold = dist_threshold
+        self.identity_size = identity_size
+        self.success_bonus = success_bonus
+
+        self.input_size = identity_size + 4
+        self.obs_dim = self.input_size + 2 * self.num_landmarks
+
+        # Single-environment VMAS
+        self._env = Environment(
+            scenario=SimpleSpreadScenario(),
+            num_envs=1,
+            device="cpu",
+            continuous_actions=True,
+            max_steps=MAX_STEPS,
+            n_agents=num_agents,
+            arena_size=arena_size,
+            dist_threshold=dist_threshold,
+            success_bonus=success_bonus,
+            identity_size=identity_size,
+            obs_agents=False,
+        )
+
+        # ---- Dummy world for learner compatibility -------------------
+        self._dummy_agent_list = [_DummyAgent(i) for i in range(num_agents)]
+        self.world = _DummyWorld(self._dummy_agent_list)
+
+        # ---- Action / observation spaces -----------------------------
+        try:
+            import gymnasium as gym
+            self.action_space = [gym.spaces.Discrete(5) for _ in range(num_agents)]
+            self.observation_space = [gym.spaces.Box(
+                low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
+            ) for _ in range(num_agents)]
+        except ImportError:
+            self.action_space = None
+            self.observation_space = None
+
+        # ---- State --------------------------------------------------
+        self.steps = 0
+        self.is_success = False
+        self.min_dists = None
+        self._np_random = np.random
+        self._seed = None
+
+        self.reset()
+
+    # ================================================================
+    #  Reset
+    # ================================================================
+    def reset(self, seed=None):
+        if seed is not None:
+            self._seed = seed
+        if self._seed is not None:
+            self._env.seed(self._seed)
+
+        obs = self._env.reset()
+        self.steps = 0
+        self.is_success = False
+        self.min_dists = None
+        return [o[0].cpu().numpy() for o in obs]
+
+    # ================================================================
+    #  Step
+    # ================================================================
+    def step(self, actions):
+        """
+        actions: list of ints [0..4], one per agent.
+        Returns: (obs_list, reward_list, done_list, info_dict)
+        """
+        # Discrete(5) → continuous forces
+        forces = []
+        for act in actions:
+            a = int(act)
+            fx, fy = ACTION_MAP[a]
+            forces.append(torch.tensor([[fx, fy]], dtype=torch.float32))
+
+        obs, rews, dones, infos = self._env.step(forces)
+
+        self.steps += 1
+
+        # --- Convert to numpy (matching PyMunk interface) ---
+        obs_list = [o[0].cpu().numpy() for o in obs]
+        reward = float(rews[0][0].cpu().numpy())
+        reward_list = [reward] * self.num_agents
+
+        # --- Compute success via Hungarian matching ---
+        self._compute_success()
+        done = bool(dones[0].cpu().numpy()) if dones is not None else False
+        done = done or self.is_success or (self.steps >= MAX_STEPS)
+        done_list = [done] * self.num_agents
+
+        info_dict = {'n': [{
+            'is_success': self.is_success,
+            'world_steps': self.steps,
+            'reward': reward,
+            'dists': float(self.min_dists.mean()) if self.min_dists is not None else 0,
+        } for _ in range(self.num_agents)]}
+
+        return obs_list, reward_list, done_list, info_dict
+
+    def _compute_success(self):
+        """Hungarian matching success check."""
+        agent_pos = np.array([
+            self._env.world.agents[i].state.pos[0].cpu().numpy()
+            for i in range(self.num_agents)
+        ])
+        landmark_pos = np.array([
+            self._env.world.landmarks[i].state.pos[0].cpu().numpy()
+            for i in range(self.num_landmarks)
+        ])
+        dists = np.array([
+            [np.linalg.norm(ap - lp) for lp in landmark_pos]
+            for ap in agent_pos
+        ])
+        ri, ci = linear_sum_assignment(dists)
+        self.min_dists = dists[ri, ci]
+        self.is_success = bool(np.all(self.min_dists < self.dist_threshold))
+
+    # ================================================================
+    #  Seed
+    # ================================================================
+    def seed(self, seed=None):
+        if seed is not None:
+            self._seed = seed
+            self._env.seed(seed)
+
+    def close(self):
+        pass
+
+    # ================================================================
+    #  Render  (delegated to VMAS)
+    # ================================================================
+    def render(self):
+        try:
+            self._env.render(env_index=0)
+        except Exception:
+            pass
+
+    # ================================================================
+    #  Info
+    # ================================================================
+    def get_env_info(self):
+        return {
+            "state_shape": self.obs_dim * self.num_agents,
+            "obs_shape": self.obs_dim,
+            "n_actions": 5,
+            "n_agents": self.num_agents,
+            "episode_limit": MAX_STEPS,
+        }
+
+
+# ============================================================
+#  Dummy classes for learner.py compatibility
+# ============================================================
+class _DummyAgent:
+    def __init__(self, idx):
+        self.iden = idx
+        self.adversary = False
+
+
+class _DummyWorld:
+    def __init__(self, agents):
+        self.agents = agents
+        self.policy_agents = agents
+
+
+# ============================================================
+#  Smoke-test
+# ============================================================
+if __name__ == "__main__":
+    print("VMAS Simple Spread — random policy test")
+    print("=" * 50)
+
+    env = VMASSimpleSpread(num_agents=5, arena_size=1.0)
+
+    obs_list = env.reset()
+    print(f"Observation shape per agent: {obs_list[0].shape}")
+    print(f"Expected: ({env.obs_dim},)")
+
+    total_reward = 0
+    for step in range(MAX_STEPS):
+        actions = [np.random.randint(0, 5) for _ in range(env.num_agents)]
+        obs_list, reward_list, done_list, info = env.step(actions)
+        total_reward += reward_list[0]
+
+        if step % 10 == 0:
+            print(f"  step {step:2d}  reward={reward_list[0]:.3f}  "
+                  f"min_dist={env.min_dists.mean():.3f}  success={env.is_success}")
+
+        if all(done_list):
+            break
+
+    print(f"\nEpisode done after {env.steps} steps, total_reward={total_reward:.2f}")
+    env.close()
+    print("Done.")
