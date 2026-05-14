@@ -146,7 +146,8 @@ class SimpleSpreadScenario(BaseScenario):
         return torch.cat(obs, dim=-1)
 
     def reward(self, agent: Agent) -> Tensor:
-        """Hungarian matching reward — computed once per step (first agent)."""
+        """Hungarian matching reward — computed once per step (first agent).
+        Also stores min_dists and is_success so the wrapper can reuse them."""
         if agent != self.world.agents[0]:
             return self._reward
 
@@ -156,15 +157,24 @@ class SimpleSpreadScenario(BaseScenario):
         dists = torch.cdist(agent_pos, landmark_pos)  # [B, N, N]
 
         self._reward = torch.zeros(B, device=self.world.device)
+        self._min_dists = torch.zeros(B, self.n_agents, device=self.world.device)
+        self._success = torch.zeros(B, dtype=torch.bool, device=self.world.device)
         for b in range(B):
             d = dists[b].cpu().numpy()
             ri, ci = linear_sum_assignment(d)
+            self._min_dists[b] = torch.as_tensor(d[ri, ci], device=self.world.device)
+            self._success[b] = bool(np.all(d[ri, ci] < self.dist_threshold))
             avg_d = d[ri, ci].mean()
             r = float(np.clip(-avg_d, -15, 15))
-            if self.success_bonus and bool(np.all(d[ri, ci] < self.dist_threshold)):
+            if self.success_bonus and self._success[b].item():
                 r += 5.0
             self._reward[b] = r
         return self._reward
+
+    def done(self):
+        """Success-based early termination (truncation handled by Environment)."""
+        return getattr(self, '_success', torch.zeros(
+            self.world.batch_dim, dtype=torch.bool, device=self.world.device))
 
     def info(self, agent: Agent):
         return {}
@@ -250,7 +260,6 @@ class VMASSimpleSpread:
         # ---- State ----------------------------------------------------
         self.ob_rms = None  # eval compat (may be set externally)
         self._seed_val = None
-        self._is_success = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self.min_dists = None
 
         self._reset_all()
@@ -260,7 +269,6 @@ class VMASSimpleSpread:
     # ================================================================
     def _reset_all(self):
         obs_list = self._env.reset()  # list of num_agents tensors [num_envs, obs_dim]
-        self._is_success.zero_()
         self.min_dists = None
         return torch.stack(obs_list, dim=1)  # [num_envs, num_agents, obs_dim]
 
@@ -297,11 +305,15 @@ class VMASSimpleSpread:
         obs_list, rews_list, vmas_dones, _infos = self._env.step(forces)
         # obs_list:  list of num_agents tensors [num_envs, obs_dim]
         # rews_list: list of num_agents tensors [num_envs]
-        # vmas_dones: tensor [num_envs]  (True when max_steps reached)
+        # vmas_dones: tensor [num_envs] (max_steps OR success — scenario.done() already included)
 
-        self._compute_success_vectorized()
+        # Read cached results from scenario (computed during reward())
+        scenario = self._env.scenario
+        self._is_success = getattr(scenario, '_success', torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device))
+        self.min_dists = getattr(scenario, '_min_dists', None)
 
-        done_env = vmas_dones | self._is_success  # [num_envs] bool
+        done_env = vmas_dones  # already includes both max_steps and success
 
         # --- Auto-reset environments that reached terminal state -----
         done_idx = torch.where(done_env)[0]
@@ -310,7 +322,7 @@ class VMASSimpleSpread:
                 self._env._reset_at(i, return_observations=False)
             # Re-read observations (mix of reset + continuing envs)
             obs_list = [
-                self._env.scenario.observation(a).clone()
+                scenario.observation(a).clone()
                 for a in self._env.agents
             ]
 
@@ -327,30 +339,6 @@ class VMASSimpleSpread:
         } for _ in range(self.num_agents)]}
 
         return obs, reward, done, info
-
-    # ================================================================
-    #  Success detection (vectorised across envs)
-    # ================================================================
-    def _compute_success_vectorized(self):
-        agent_pos = torch.stack(
-            [a.state.pos for a in self._env.world.agents], dim=1
-        )  # [num_envs, num_agents, 2]
-        landmark_pos = torch.stack(
-            [l.state.pos for l in self._env.world.landmarks], dim=1
-        )  # [num_envs, num_landmarks, 2]
-        dists = torch.cdist(agent_pos, landmark_pos)  # [num_envs, N, N]
-
-        self.min_dists = torch.zeros(self.num_envs, self.num_agents,
-                                      device=self.device)
-        for b in range(self.num_envs):
-            d = dists[b].cpu().numpy()
-            ri, ci = linear_sum_assignment(d)
-            self.min_dists[b] = torch.as_tensor(d[ri, ci], device=self.device)
-            self._is_success[b] = bool(np.all(d[ri, ci] < self.dist_threshold))
-
-        # Reset success flag for just-reset envs (steps == 0)
-        just_reset = self._env.steps == 0
-        self._is_success[just_reset] = False
 
     # ================================================================
     #  Seed
